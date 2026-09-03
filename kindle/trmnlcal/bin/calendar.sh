@@ -1933,7 +1933,7 @@ check_update_probation "$@"
 # update actually applied: bump SCRIPT_VERSION by hand on future edits, and the md5
 # is read fresh off disk here so it always reflects whatever is CURRENTLY running,
 # including a script that was just swapped in by apply_script_update.
-SCRIPT_VERSION="${TRMNL_SCRIPT_VERSION:-2026-08-24.1}"
+SCRIPT_VERSION="${TRMNL_SCRIPT_VERSION:-2026-09-03.1}"
 SCRIPT_MD5=""
 if [ -n "$SCRIPT_PATH" ] && [ -r "$SCRIPT_PATH" ] && command -v md5sum >/dev/null 2>&1; then
     SCRIPT_MD5=$(md5sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')
