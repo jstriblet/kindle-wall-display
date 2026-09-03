@@ -1464,11 +1464,34 @@ main_loop() {
         # must be brought back at the top of every cycle before anything needs the
         # network. wifi_up is cheap and idempotent when the radio is already on.
         wifi_up
-        # Quick UNHELD probe first. On a healthy cycle the radio associates in a few
-        # seconds, so this returns fast and we never hold the screensaver - normal
-        # suspends stay exactly as before, months-class battery untouched.
+        # Quick probe first, but no longer UNHELD. On 2026-08-19 the retry-loop
+        # call below was hardened with a re-arm-before-waiting because an
+        # uncontrolled powerd suspend catching wait_for_wifi() mid-call, with
+        # only the once-armed cycle-top alarm behind it, cost a ~19h dark
+        # screen. On 2026-09-02 the SAME class of gap existed at THIS call
+        # site instead - the cycle-top alarm at $(( iv + SAFETY_GRACE ))s was
+        # already elapsed by the time anyone noticed, and there was no hold to
+        # stop powerd idle-suspending out from under it either. Re-arm and
+        # hold here too, then release immediately after - on a healthy cycle
+        # this returns in a few seconds either way, so normal suspends still
+        # cost nothing; the hold/release pair is the only new expense, not a
+        # standing one, so months-class battery is untouched.
+        screensaver_hold
+        if arm_alarm $(( iv + SAFETY_GRACE )); then
+            log "safety alarm re-armed for $(( iv + SAFETY_GRACE ))s before first wifi probe"
+        else
+            log "WARN safety alarm could NOT be re-armed before first wifi probe"
+        fi
+        # Report BEFORE the risky call, not only after. WIFIDIAG only ever
+        # fires once wait_for_wifi() RETURNS, so a probe that never returns -
+        # exactly what happened at 13:27:00 on 2026-09-02 - had produced zero
+        # server-side signal for a full day before the silence was noticed.
+        # This tag alone, arriving and then never being followed by a CYCLE
+        # line, is now the evidence a hung probe leaves behind.
+        push_log "wifi-probe-begin cycle=$n" 15
         wifi_s=$(wait_for_wifi "$WIFI_PROBE_WAIT")
         wifi_ok=$?
+        screensaver_release
         # If the radio did not reassociate, hard-cycle it and wait again, a few times
         # (the 2026-08-09 fix for a wedged adapter). Do this with the device HELD
         # AWAKE: taking the radio down inside wifi_reset releases the WLAN wakelock,
@@ -1480,6 +1503,12 @@ main_loop() {
         # never an open-ended awake loop; the awake-fallback pattern stays banned.
         if [ "$wifi_ok" -ne 0 ]; then
             wifi_diag_snapshot "probe-failed"
+            # Same "report before, not just after" reasoning as the first
+            # probe: a hang on retry 2 or 3 below is just as invisible as one
+            # on the first probe, and this is also the one moment the freshly
+            # collected wifi_diag_snapshot lines above are guaranteed to
+            # still be sitting only in the local log, not yet on the server.
+            push_log "wifi-recovery-begin cycle=$n" 20
             screensaver_hold
             wifi_try=1
             while [ "$wifi_ok" -ne 0 ] && [ "$wifi_try" -le "$WIFI_RESET_TRIES" ]; do
