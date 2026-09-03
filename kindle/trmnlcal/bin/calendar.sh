@@ -117,17 +117,34 @@ POWER_STATE="${TRMNL_POWER_STATE:-/sys/power/state}"
 #   2. WATCHDOG PROCESS, separate from the loop, checking a heartbeat file. The
 #      safety alarm wakes the hardware, but a dead loop cannot restart itself,
 #      so something outside it has to. It is deliberately tiny: sleep, read a
-#      number, compare, restart. Nothing it does can block.
+#      number, compare, restart. Its restart branch does touch the network
+#      (wifi_up_bounded(), to try to report before killing anything) - that is
+#      bounded on purpose (2026-09-03) so it can never itself become a second
+#      unbounded hang; see wifi_up_bounded()'s comment for why that mattered.
 #
 # The watchdog is frozen along with everything else during suspend-to-RAM and
 # resumes with the device, so it measures wall-clock age from the heartbeat file
 # rather than counting its own iterations. That means STALE must comfortably
 # exceed one whole sleep: a normal heartbeat is ~interval seconds old at wake.
+#
+# 2026-09-03: eleven restarts in the week to 09-02 all fired with the
+# heartbeat consistently ~3100-3150s stale, not the ~2400-2520s the old
+# 2400s/120s pair alone would predict - the loop typically doesn't hang right
+# at the heartbeat write, but some minutes into the cycle body (wifi retries,
+# fetch/draw, suspend retries), so real staleness is already nonzero before
+# the STALE clock even starts counting. Each catch was costing ~50 minutes of
+# missed updates. Lowered STALE from 2400s to 1800s (still 2x the DEFAULT
+# 900s interval, comfortably above one full sleep) and POLL from 120s to 60s,
+# trimming the fixed part of that cost by roughly 10-11 minutes per catch.
+# CAVEAT: the watchdog is a separate process from the loop and has no
+# visibility into a server-served interval longer than the 900s default - if
+# that is ever configured, STALE must be raised by hand (TRMNL_WD_STALE) to
+# stay above it, since nothing here enforces that relationship automatically.
 HBFILE="$BASE/heartbeat"
 WDPIDFILE="$BASE/watchdog.pid"
 WDLOG="$BASE/watchdog.log"
-WD_POLL="${TRMNL_WD_POLL:-120}"          # how often the watchdog looks
-WD_STALE="${TRMNL_WD_STALE:-2400}"       # 40 min: > one 900s sleep plus slack
+WD_POLL="${TRMNL_WD_POLL:-60}"           # how often the watchdog looks
+WD_STALE="${TRMNL_WD_STALE:-1800}"       # 30 min: 2x the 900s default interval
 SAFETY_GRACE="${TRMNL_SAFETY_GRACE:-600}"  # safety alarm = interval + this
 
 # Host to ping when checking Wi-Fi is back, derived from SERVER unless overridden.
@@ -495,6 +512,30 @@ wifi_up() {
     fi
     iface=$(awk 'NR > 2 && /:/ { sub(/:$/, "", $1); print $1; exit }' /proc/net/wireless 2>/dev/null)
     [ -n "$iface" ] && command -v ifconfig >/dev/null 2>&1 && ifconfig "$iface" up >/dev/null 2>&1
+    return 0
+}
+
+# Bounded variant for callers that must never block on wifi_up() - specifically
+# the watchdog (see __watchdog below). Every curl/wget call in this script is
+# timeout-bound (-m/-T), but lipc-set-prop/wifid/ifconfig here never were: on
+# 2026-09-02 the loop hung inside wait_for_wifi() at 13:27:00 and the watchdog,
+# which had already caught and relaunched a dead loop four times that day, never
+# fired again - and its own restart path calls plain wifi_up() to bring the
+# radio up before reporting. If wifi/its IPC is in the same wedged state that
+# hung the loop, that call hangs the watchdog too, with nothing left watching
+# anything. Runs wifi_up() in the background and abandons it past the bound
+# instead of waiting on it - the orphaned lipc/wifid/ifconfig call may keep
+# running, but the caller is never stuck on it.
+wifi_up_bounded() {   # $1 = bound in seconds, default 5
+    _bound="${1:-5}"
+    ( wifi_up ) &
+    _wp=$!
+    _n=0
+    while [ "$_n" -lt "$_bound" ] && kill -0 "$_wp" 2>/dev/null; do
+        sleep 1
+        _n=$((_n + 1))
+    done
+    kill -0 "$_wp" 2>/dev/null && kill -9 "$_wp" 2>/dev/null
     return 0
 }
 
@@ -1933,9 +1974,14 @@ case "$1" in
         # thing that restarts a dead loop cannot live inside it.
         #
         # Kept deliberately stupid. It sleeps, reads one integer, compares it, and
-        # in the bad case kills and relaunches. No network, no drawing, no
-        # subshells that can block. Anything clever in here is another thing that
-        # can wedge, and then nothing is watching at all.
+        # in the bad case kills and relaunches. No drawing, no unbounded network
+        # call, no subshell it doesn't control the lifetime of. Anything clever in
+        # here is another thing that can wedge, and then nothing is watching at
+        # all - which the restart path's own plain wifi_up() call risked before
+        # it was changed to wifi_up_bounded() below (2026-09-03; see that
+        # function's comment - unconfirmed whether this specific mechanism is
+        # what silenced the watchdog on 2026-09-02, but it is a real, previously
+        # unbounded call on this exact path and worth closing regardless).
         trap '' HUP
         echo $$ > "$WDPIDFILE"
         wdlog "watchdog started pid $$ poll=${WD_POLL}s stale=${WD_STALE}s"
@@ -1964,7 +2010,8 @@ case "$1" in
             # Report BEFORE touching anything. push_log needs the radio, and a
             # restart may take the radio down; the existing suspend-refused path
             # already loses its message that way. Say it while we still can.
-            wifi_up >/dev/null 2>&1
+            # Bounded, not plain wifi_up - see wifi_up_bounded()'s comment.
+            wifi_up_bounded 5 >/dev/null 2>&1
             push_log "watchdog-restart" 30
             echo "watchdog-stale-heartbeat age=${age}s restarts=$wd_restarts at=$(date +%s)" > "$RESTART_REASON_FILE" 2>/dev/null
 
