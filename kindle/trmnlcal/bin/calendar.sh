@@ -33,7 +33,10 @@
 # Every wake logs battery percentage, so an overnight run yields drain-per-wake.
 #
 # The TRMNL_* environment overrides exist for the host-side test harness; they are
-# never set on the device, so every default below is the real device value.
+# never set on the device, so every default below is the real device value -
+# except SERVER, which is a placeholder in this public repo on purpose. The
+# real address is never committed here; it lives only in the private server's
+# served copy of this file.
 #
 # Usage: calendar.sh once | suspendtest [seconds] | start | stop | probe | ruler
 
@@ -53,6 +56,12 @@ PENDING_ACK_FILE="$BASE/pending_ack"       # id owed an ack on the next successf
 PREV_SCRIPT_FILE="$BASE/calendar.sh.prev"      # last-known-good, saved before every swap
 UPDATE_PROBATION_FILE="$BASE/update_probation" # absolute deadline epoch; presence = "on probation"
 UPDATE_OK_FILE="$BASE/update_ok"               # presence = a post-update cycle actually completed
+RESTART_REASON_FILE="$BASE/restart_reason"     # why the PREVIOUS process ended, written by
+                                                # whichever code path is about to kill/replace it
+LOG_BASE_LINES_FILE="$BASE/calendar.log.baselines" # cumulative lines rotated away BEFORE the
+                                                    # current live calendar.log (2026-08-26)
+LOG_UPLOADED_FILE="$BASE/calendar.log.uploaded"    # highest cumulative log line confirmed
+                                                    # delivered to the server with no gap before it
 FBINK="${TRMNL_FBINK:-/mnt/us/libkh/bin/fbink}"
 
 INTERVAL="${TRMNL_INTERVAL:-900}"    # fallback seconds between refreshes; the live
@@ -73,10 +82,19 @@ REDRAW_EVERY="${TRMNL_REDRAW_EVERY:-30}"         # re-blit cadence during awake 
 HEARTBEAT_EVERY="${TRMNL_HEARTBEAT_EVERY:-30}"  # log a liveness line this often while waiting
 AWAKE_WALL_BUDGET_MULT="${TRMNL_AWAKE_WALL_BUDGET_MULT:-2}"    # awake_sleep bails out once REAL
 AWAKE_WALL_BUDGET_GRACE="${TRMNL_AWAKE_WALL_BUDGET_GRACE:-120}" # elapsed time exceeds total*MULT+GRACE
+SUSPEND_OVERSLEEP_MULT="${TRMNL_SUSPEND_OVERSLEEP_MULT:-2}"     # slept > iv*MULT flags a suspend as overslept
 KILL_WINDOW="${TRMNL_KILL_WINDOW:-5}"            # pause before suspend so stop can win
 MAX_FAILS=3
 SUSPEND_RETRIES="${TRMNL_SUSPEND_RETRIES:-5}"   # transient display/wifi locks clear in seconds
 SUSPEND_RETRY_WAIT="${TRMNL_SUSPEND_RETRY_WAIT:-4}"
+PUSH_LOG_MAX_LINES="${TRMNL_PUSH_LOG_MAX_LINES:-200}"  # a push_log tail bigger than this is
+                                                        # split into numbered POSTs (2026-08-26)
+LOG_MAX_BYTES="${TRMNL_LOG_MAX_BYTES:-1000000}"  # calendar.log rotates past this (2026-08-26);
+                                                  # ~1MB is weeks of normal cycle logging, so this
+                                                  # only ever trims genuinely old history
+WIFI_LADDER_RUNG1_FAILS="${TRMNL_WIFI_LADDER_RUNG1_FAILS:-2}"  # consecutive wifi-failed cycles
+WIFI_LADDER_RUNG2_FAILS="${TRMNL_WIFI_LADDER_RUNG2_FAILS:-4}"  # before escalating to the next
+WIFI_LADDER_RUNG3_FAILS="${TRMNL_WIFI_LADDER_RUNG3_FAILS:-6}"  # rung (2026-08-26 self-heal ladder)
 
 RTC_ALARM="${TRMNL_RTC_ALARM:-/sys/class/rtc/rtc0/wakealarm}"
 RTC_ALARM_BACKUP="${TRMNL_RTC_ALARM_BACKUP:-/sys/class/rtc/rtc1/wakealarm}"
@@ -141,6 +159,82 @@ heartbeat() {
     date +%s > "$HBFILE" 2>/dev/null
 }
 
+# ---------------------------------------------------------------- log retention
+#
+# calendar.log itself has never been truncated by this script - log() only ever
+# appends. What actually loses evidence (2026-08-26: a cycle-counter reset from
+# n=95 to n=2 destroyed the ability to re-pull an earlier window) is that a big
+# pull only ever asks for the last N lines: once enough new cycles accumulate
+# after an interesting window, that window ages out of any tail request nobody
+# has made yet. These functions close that gap: a size cap so calendar.log can
+# never fill the Kindle's flash, and a durable cursor so a startup backlog
+# upload (see upload_backlog_if_any, called from main_loop) always ships
+# whatever was written but never confirmed delivered before this process
+# started - without anyone having to ask for it before it ages out.
+
+# Cumulative count of every line ever written to calendar.log, unaffected by
+# rotation truncating the live file: LOG_BASE_LINES_FILE holds whatever was
+# rotated away before now, and this adds however many lines are in the current
+# live file on top of that.
+total_log_lines() {
+    base=$(cat "$LOG_BASE_LINES_FILE" 2>/dev/null)
+    case "$base" in ''|*[!0-9]*) base=0 ;; esac
+    cur=$(wc -l < "$LOG" 2>/dev/null | tr -d ' ')
+    case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+    echo $(( base + cur ))
+}
+
+# Keeps calendar.log from growing without bound on the Kindle's limited flash.
+# One rotation generation only (calendar.log -> calendar.log.1): this is a
+# diagnostic log that needs recent history, not an archive. Called once per
+# main_loop iteration, not per log() line, so normal logging never pays for it.
+rotate_log_if_needed() {
+    [ -f "$LOG" ] || return 0
+    size=$(wc -c < "$LOG" 2>/dev/null | tr -d ' ')
+    case "$size" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$size" -le "$LOG_MAX_BYTES" ] && return 0
+
+    rotated_lines=$(wc -l < "$LOG" 2>/dev/null | tr -d ' ')
+    case "$rotated_lines" in ''|*[!0-9]*) rotated_lines=0 ;; esac
+    base=$(cat "$LOG_BASE_LINES_FILE" 2>/dev/null)
+    case "$base" in ''|*[!0-9]*) base=0 ;; esac
+    echo $(( base + rotated_lines )) > "$LOG_BASE_LINES_FILE" 2>/dev/null
+
+    mv "$LOG" "$LOG.1" 2>/dev/null
+    log "calendar.log rotated at ${size} bytes (cap ${LOG_MAX_BYTES}); history before this point is in calendar.log.1"
+}
+
+# On startup, calendar.log may already hold lines that were written but never
+# confirmed delivered - most often because the PREVIOUS process ended (crash,
+# watchdog kill, update) before its next scheduled push_log call went out.
+# Called once, from the first successful network cycle after this process
+# started (see main_loop): ships that backlog automatically, tagged distinctly,
+# instead of waiting for someone to notice and ask for a large pull before it
+# ages out of range.
+upload_backlog_if_any() {
+    total=$(total_log_lines)
+    uploaded=$(cat "$LOG_UPLOADED_FILE" 2>/dev/null)
+    case "$uploaded" in ''|*[!0-9]*) uploaded=0 ;; esac
+    gap=$(( total - uploaded ))
+    [ "$gap" -le 0 ] && return 0
+
+    # A gap this large usually means LOG_UPLOADED_FILE predates a rotation (the
+    # lines it refers to no longer exist in the live file) rather than a real
+    # backlog - cap to what the live file actually holds so this can never ask
+    # push_log for more lines than calendar.log has.
+    live=$(wc -l < "$LOG" 2>/dev/null | tr -d ' ')
+    case "$live" in ''|*[!0-9]*) live=0 ;; esac
+    [ "$gap" -gt "$live" ] && gap="$live"
+    [ "$gap" -le 0 ] && return 0
+
+    # Logged AFTER push_log, deliberately: push_log's tail read happens first
+    # thing inside that call, and a log() line written before it would itself
+    # land inside the tail window and push the oldest wanted line back out -
+    # exactly the off-by-one this feature exists to stop causing elsewhere.
+    push_log "backlog-recovery" "$gap"
+    log "startup backlog: $gap line(s) written before this process started were uploaded (tag backlog-recovery)"
+}
+
 # Ship the tail of the log to the server. This exists so that diagnosing this
 # device NEVER requires another USB pass: every plug/unplug cycle costs Jonathan
 # real time and broke his patience on 2026-08-04, fairly. Best effort only - it
@@ -155,32 +249,98 @@ heartbeat() {
 # not nested, mirroring the cmd_* fields on /api/display - the device never needs
 # a JSON library, only sed/awk key:value extraction, in either direction.
 ACK_ID=""
-push_log() {   # $1 = short reason tag, $2 = how many trailing lines
-    [ -n "$HTTP" ] || return 0
-    tail_n="${2:-40}"
-    body=$(tail -n "$tail_n" "$LOG" 2>/dev/null \
-        | tr -d '\\"' | tr '\t' ' ' | awk '{printf "%s | ", $0}')
-    extra=""
-    [ -n "$SCRIPT_VERSION" ] && extra="$extra,\"version\":\"$SCRIPT_VERSION\""
-    [ -n "$SCRIPT_MD5" ] && extra="$extra,\"script_md5\":\"$SCRIPT_MD5\""
-    [ -n "$ACK_ID" ] && extra="$extra,\"ack_command_id\":\"$ACK_ID\""
-    payload="{\"device\":\"$DEVICE\",\"tag\":\"KINDLE_LOG ${1:-tick}\",\"body\":\"$body\"$extra}"
+
+# Post one already-built JSON payload to $SERVER/api/log. The payload travels via
+# a temp file read with curl/wget's "read the body from a file" form, never as a
+# single inline -d/--post-data shell argument. 2026-08-26: the 1000-line
+# upload-full-log slice vanished between the device logging "starting the
+# upload" and the server ever seeing a POST, with no error either side - a large
+# inline argument is the one part of the old push_log that could fail silently
+# like that. Sets push_rc; on failure also logs the exit status and payload size
+# in bytes, so the NEXT silent-looking failure explains itself from calendar.log
+# alone. $2 is only used in that failure log line, to name which part failed.
+_push_log_post() {   # $1 = JSON payload string, $2 = label for the failure log line
+    payload_file="$BASE/push_log.payload.$$"
+    printf '%s' "$1" > "$payload_file"
+    payload_bytes=$(wc -c < "$payload_file" 2>/dev/null | tr -d ' ')
     push_rc=1
     case "$HTTP" in
         curl) curl -s -m 15 -X POST -H "Content-Type: application/json" \
-                   -d "$payload" "$SERVER/api/log" >/dev/null 2>&1
+                   --data-binary "@$payload_file" "$SERVER/api/log" >/dev/null 2>&1
               push_rc=$? ;;
         wget) wget -q -T 15 -O /dev/null --header="Content-Type: application/json" \
-                   --post-data="$payload" "$SERVER/api/log" >/dev/null 2>&1
+                   --post-file="$payload_file" "$SERVER/api/log" >/dev/null 2>&1
               push_rc=$? ;;
     esac
-    # Only clear the owed ack once it has actually gone out. A failed POST leaves
-    # ACK_ID (and PENDING_ACK_FILE, which survives a restart) set so the very next
-    # push_log call - or the next loop process, after a restart - tries again.
-    if [ "$push_rc" -eq 0 ] && [ -n "$ACK_ID" ]; then
+    [ "$push_rc" -ne 0 ] && log "ERROR push_log[$2] POST failed rc=$push_rc bytes=${payload_bytes:-unknown}"
+    # Per-call scratch file, not device state - no trash-put on this firmware, and
+    # nothing here is worth a rename-don't-delete audit trail like stop.flag/pidfile.
+    rm -f "$payload_file" 2>/dev/null
+    return "$push_rc"
+}
+
+push_log() {   # $1 = short reason tag, $2 = how many trailing lines
+    [ -n "$HTTP" ] || return 0
+    tail_n="${2:-40}"
+    lines_file="$BASE/push_log.lines.$$"
+    tail -n "$tail_n" "$LOG" 2>/dev/null > "$lines_file"
+    total_lines=$(wc -l < "$lines_file" 2>/dev/null | tr -d ' ')
+    case "$total_lines" in ''|*[!0-9]*) total_lines=0 ;; esac
+
+    # A tail within PUSH_LOG_MAX_LINES goes out as one POST, same as before. A
+    # bigger one (the 1000-line upload-full-log diagnostic) is split into several
+    # numbered parts, none of them big enough to risk the same silent failure -
+    # the server (commands.receive_log_part) buffers and joins them back in order.
+    if [ "$total_lines" -le "$PUSH_LOG_MAX_LINES" ]; then
+        parts=1
+    else
+        parts=$(( (total_lines + PUSH_LOG_MAX_LINES - 1) / PUSH_LOG_MAX_LINES ))
+    fi
+    batch_id="$$-$(date +%s)"
+
+    all_ok=1   # flips to 0 on any part's failure; the owed ack only clears when every part went out
+    part=1
+    start=1
+    while [ "$part" -le "$parts" ]; do
+        end=$(( start + PUSH_LOG_MAX_LINES - 1 ))
+        [ "$end" -gt "$total_lines" ] && end="$total_lines"
+        body=$(sed -n "${start},${end}p" "$lines_file" | tr -d '\\"' | tr '\t' ' ' | awk '{printf "%s | ", $0}')
+
+        extra=""
+        [ -n "$SCRIPT_VERSION" ] && extra="$extra,\"version\":\"$SCRIPT_VERSION\""
+        [ -n "$SCRIPT_MD5" ] && extra="$extra,\"script_md5\":\"$SCRIPT_MD5\""
+        [ -n "$ACK_ID" ] && extra="$extra,\"ack_command_id\":\"$ACK_ID\""
+        [ "$parts" -gt 1 ] && extra="$extra,\"part_index\":$part,\"part_total\":$parts,\"batch_id\":\"$batch_id\""
+        payload="{\"device\":\"$DEVICE\",\"tag\":\"KINDLE_LOG ${1:-tick}\",\"body\":\"$body\"$extra}"
+
+        _push_log_post "$payload" "${1:-tick} $part/$parts" || all_ok=0
+
+        part=$((part + 1))
+        start=$((end + 1))
+    done
+    rm -f "$lines_file" 2>/dev/null
+
+    # Only clear the owed ack once every part has actually gone out. A failed POST
+    # leaves ACK_ID (and PENDING_ACK_FILE, which survives a restart) set so the
+    # very next push_log call - or the next loop process, after a restart - tries
+    # again.
+    if [ "$all_ok" -eq 1 ] && [ -n "$ACK_ID" ]; then
         log "ack sent for command id=$ACK_ID"
         ACK_ID=""
         : > "$PENDING_ACK_FILE" 2>/dev/null
+    fi
+
+    # Advance the uploaded-cursor only when this push's range reaches back far
+    # enough to close any existing gap with no hole left in the middle -
+    # otherwise a routine short push (last 12-40 lines) would wrongly mark an
+    # earlier, still-unsent stretch as delivered, and upload_backlog_if_any
+    # would never catch it on the next restart.
+    if [ "$all_ok" -eq 1 ]; then
+        log_total_now=$(total_log_lines)
+        already_uploaded=$(cat "$LOG_UPLOADED_FILE" 2>/dev/null)
+        case "$already_uploaded" in ''|*[!0-9]*) already_uploaded=0 ;; esac
+        covered_from=$(( log_total_now - total_lines ))
+        [ "$covered_from" -le "$already_uploaded" ] && echo "$log_total_now" > "$LOG_UPLOADED_FILE" 2>/dev/null
     fi
     return 0
 }
@@ -438,6 +598,87 @@ wait_for_wifi() {   # $1 = optional max seconds (default WIFI_MAX_WAIT); echoes 
     wifi_log_suspend_gap "$w0" "$u0" timeout
     echo $(( $(date +%s) - w0 ))
     return 1
+}
+
+# ---------------------------------------------------------------- wifi self-heal ladder (2026-08-26)
+#
+# 190 healthy cycles against 2 failures in the recent buffer, both self-clearing
+# on the next cycle, show that a one-off blip is already handled fine by the
+# in-cycle wifi_reset retries above. What is NOT handled is the interface
+# staying stuck across MULTIPLE consecutive cycles, which is what precedes the
+# long dark stretches - so this escalates only on consecutive wifi-failed
+# CYCLES (main_loop's wifi_fails counter), never on the first one, and each
+# rung is strictly stronger than the last.
+#
+# HARD CONSTRAINT: every rung runs BEFORE main_loop's normal suspend logic and
+# never touches it - the same interval, the same wifi_down-then-arm_alarm path,
+# always follows unchanged. No rung leaves the device awake or shortens the
+# sleep; months-class battery through suspend is non-negotiable. Rung 3 is the
+# one exception to "returns normally": it respawns the process, exactly like
+# the server's own `restart` command, and the NEW process runs its own first
+# cycle through that same unchanged suspend path.
+
+# Rung 1: force a full interface down/up even when the soft lipc/wifid toggle
+# already reports success. wifi_reset()'s in-cycle retries above stop at
+# whichever method answers first, which may still be reusing a stale
+# association - this always also bounces the interface itself.
+wifi_ladder_rung1() {
+    log "WIFI-LADDER rung1 (${wifi_fails} consecutive wifi-failed cycles): forcing full interface down/up"
+    wifi_down
+    sleep 3
+    iface=$(awk 'NR > 2 && /:/ { sub(/:$/, "", $1); print $1; exit }' /proc/net/wireless 2>/dev/null)
+    if [ -n "$iface" ] && command -v ifconfig >/dev/null 2>&1; then
+        ifconfig "$iface" down >/dev/null 2>&1
+        sleep 1
+        ifconfig "$iface" up >/dev/null 2>&1
+        log "WIFI-LADDER rung1: ifconfig $iface down/up"
+    fi
+    if command -v wifid >/dev/null 2>&1; then
+        wifid disable >/dev/null 2>&1
+        wifid enable >/dev/null 2>&1
+    fi
+    wifi_up
+    sleep 2
+}
+
+# Rung 2: the daemon itself, not just the interface - in case wifid is what is
+# actually wedged, where toggling association alone would never help.
+wifi_ladder_rung2() {
+    log "WIFI-LADDER rung2 (${wifi_fails} consecutive wifi-failed cycles): restarting the wifi daemon"
+    method=""
+    if command -v initctl >/dev/null 2>&1; then
+        initctl stop wifid >/dev/null 2>&1 && method="initctl wifid"
+    fi
+    if [ -z "$method" ] && [ -x /etc/init.d/wifid ]; then
+        /etc/init.d/wifid stop >/dev/null 2>&1 && method="init.d wifid"
+    fi
+    sleep 2
+    case "$method" in
+        "initctl wifid")  initctl start wifid >/dev/null 2>&1 ;;
+        "init.d wifid")   /etc/init.d/wifid start >/dev/null 2>&1 ;;
+        *) command -v initctl >/dev/null 2>&1 && initctl start wifid >/dev/null 2>&1 ;;
+    esac
+    if [ -n "$method" ]; then
+        log "WIFI-LADDER rung2: wifid restarted via $method"
+    else
+        log "WIFI-LADDER rung2: WARN no wifid stop method worked; falling back to rung1's interface bounce"
+        wifi_ladder_rung1
+        return
+    fi
+    wifi_up
+    sleep 2
+}
+
+# Rung 3: the biggest hammer available without a power cycle or a server-sent
+# restart command - reinitializes everything (rtc detection, wifi state, PID)
+# by relaunching the loop fresh, exactly like the server's own `restart`
+# command (see apply_pending_command). Does not return: respawn_loop kills
+# this process once the fresh __loop is launched.
+wifi_ladder_rung3() {
+    log "WIFI-LADDER rung3 (${wifi_fails} consecutive wifi-failed cycles): respawning the loop process"
+    echo "wifi-ladder-rung3 wifi_fails=$wifi_fails at=$(date +%s)" > "$RESTART_REASON_FILE" 2>/dev/null
+    push_log "wifi-ladder-rung3-respawn" 30
+    respawn_loop
 }
 
 # ---------------------------------------------------------------- fetch
@@ -1049,6 +1290,7 @@ apply_script_update() {
     fi
 
     log "COMMAND fetch-and-replace-script: applied sha256=$got_sha, relaunching"
+    echo "script-update sha256=$got_sha at=$(date +%s)" > "$RESTART_REASON_FILE" 2>/dev/null
     push_log "command-update-applied" 15
     respawn_loop
 }
@@ -1130,6 +1372,7 @@ apply_pending_command() {
             ;;
         restart)
             log "COMMAND restart: relaunching loop"
+            echo "server-restart-command id=$CMD_ID at=$(date +%s)" > "$RESTART_REASON_FILE" 2>/dev/null
             push_log "command-restart" 15
             respawn_loop
             ;;
@@ -1159,7 +1402,12 @@ apply_pending_command() {
 main_loop() {
     n=0
     fails=0           # consecutive failed cycles (wifi or fetch)
+    wifi_fails=0      # consecutive cycles where wifi ITSELF stayed down after all in-cycle
+                      # retries - drives the self-heal ladder below, separately from `fails`,
+                      # so a healthy-wifi/server-down cycle never triggers a wifi remedy
     suspend_fails=0   # consecutive failed suspends; at MAX_FAILS suspend is abandoned
+    backlog_checked=0 # upload_backlog_if_any runs once, on this process's first successful
+                      # network cycle, never again in this process's lifetime
     draws=0
     iv="$INTERVAL"    # effective interval; updated from the served value each cycle
     iv_src=default
@@ -1178,6 +1426,7 @@ main_loop() {
 
         n=$((n + 1))
         heartbeat
+        rotate_log_if_needed
         # Reset every iteration - apply_pending_command (below, via
         # upload-full-log) is the only thing that ever sets this, and it must
         # never leak forward into a later cycle that had no command at all.
@@ -1260,6 +1509,17 @@ main_loop() {
             [ "$wifi_ok" -ne 0 ] && wifi_diag_snapshot "gave-up"
         fi
 
+        # Self-heal ladder bookkeeping: tracks CONSECUTIVE cycles where wifi
+        # itself stayed down after every in-cycle retry above, separately from
+        # `fails` below - a server-side outage with healthy wifi must never
+        # trigger a wifi remedy. Escalation happens later, once this cycle's
+        # outcome (and its push_log evidence) is logged.
+        if [ "$wifi_ok" -ne 0 ]; then
+            wifi_fails=$((wifi_fails + 1))
+        else
+            wifi_fails=0
+        fi
+
         cycle_ok=1
         if [ "$wifi_ok" -ne 0 ]; then
             log "CYCLE n=$n batt=${batt:-none} wifi=FAIL(${wifi_s}s) fetch=skipped"
@@ -1290,6 +1550,15 @@ main_loop() {
                     log "update probation cleared: first successful cycle after update confirmed healthy"
                     push_log "update-confirmed-healthy" 15
                 fi
+                # First fully successful cycle of THIS process's lifetime: ship
+                # anything the previous process wrote but never confirmed
+                # delivered (see upload_backlog_if_any). Once only, ever, per
+                # process - a restart-heavy stretch must not re-upload the same
+                # backlog on every subsequent healthy cycle.
+                if [ "$backlog_checked" -eq 0 ]; then
+                    backlog_checked=1
+                    upload_backlog_if_any
+                fi
             else
                 log "CYCLE n=$n batt=${batt:-none} wifi=${wifi_s}s fetch=FAIL"
             fi
@@ -1316,6 +1585,22 @@ main_loop() {
             # one would show, and firing both back-to-back is what made the
             # command's own (larger) push vanish on 2026-08-22.
             [ "$SKIP_NORMAL_PUSH" -eq 1 ] || push_log "cycle-failed" 20
+
+            # Self-heal ladder: escalates ONLY on consecutive wifi-failed
+            # cycles, never on the first one, and each check picks the single
+            # strongest rung currently justified (elif, highest threshold
+            # first) rather than cascading through all of them at once. Runs
+            # here, BEFORE the suspend logic below, and every rung either
+            # returns quickly or (rung3) hands off to a fresh process that
+            # reaches the same suspend logic on its own - the interval and the
+            # suspend path itself are never touched by any rung.
+            if [ "$wifi_fails" -ge "$WIFI_LADDER_RUNG3_FAILS" ]; then
+                wifi_ladder_rung3
+            elif [ "$wifi_fails" -ge "$WIFI_LADDER_RUNG2_FAILS" ]; then
+                wifi_ladder_rung2
+            elif [ "$wifi_fails" -ge "$WIFI_LADDER_RUNG1_FAILS" ]; then
+                wifi_ladder_rung1
+            fi
         else
             fails=0
             [ "$SKIP_NORMAL_PUSH" -eq 1 ] || push_log "cycle-ok" 12
@@ -1397,6 +1682,31 @@ main_loop() {
         [ -r /sys/power/wakeup_count ] && wakeup_count_before=$(cat /sys/power/wakeup_count 2>/dev/null)
         susp_try=1
         while [ "$susp_try" -le "$SUSPEND_RETRIES" ]; do
+            # 2026-08-24: a device slept 36890s instead of a requested 900s
+            # after this exact sequence - alarm armed cleanly, first suspend
+            # write refused (EBUSY), a LATER retry then succeeded, and the
+            # alarm never fired on schedule. Suspected mechanism: the refused
+            # attempt itself consumes or clears the RTC's committed alarm
+            # state even though the sysfs register still reads back the old
+            # (now hardware-stale) value from before - so the retry that
+            # actually succeeds can suspend with no real alarm behind it.
+            # Verifying - and re-arming if needed - immediately before EVERY
+            # attempt, not just once before the loop, means whichever attempt
+            # actually succeeds always has a freshly-confirmed future alarm,
+            # regardless of what a prior refusal may have done to it.
+            current_alarm=$(cat "$RTC_ALARM" 2>/dev/null)
+            now_check=$(date +%s)
+            case "$current_alarm" in
+                ''|*[!0-9]*) current_alarm=0 ;;
+            esac
+            if [ "$current_alarm" -le "$now_check" ] 2>/dev/null; then
+                log "WARN RTC alarm register not future-dated before suspend attempt $susp_try/$SUSPEND_RETRIES (read back '$current_alarm'); re-arming before proceeding"
+                if ! arm_alarm "$iv"; then
+                    log "ERROR could not re-arm RTC alarm mid-retry ($susp_try/$SUSPEND_RETRIES); treating as a refused suspend rather than risking a suspend with no alarm behind it"
+                    susp_try=$((SUSPEND_RETRIES + 1))
+                    break
+                fi
+            fi
             do_suspend "$iv" && break
             if [ "$susp_try" -lt "$SUSPEND_RETRIES" ]; then
                 log "suspend refused (attempt $susp_try/$SUSPEND_RETRIES); waiting ${SUSPEND_RETRY_WAIT}s for transient locks to clear"
@@ -1417,6 +1727,17 @@ main_loop() {
         fi
 
         if suspend_held "$iv"; then
+            # suspend_held() only ever checked a LOWER bound (slept >= 7/8 of
+            # target) - it has no upper bound, so a device that overslept its
+            # alarm by 40x (2026-08-24: 36890s instead of 900s) still reads as
+            # a clean pass here, with nothing in the log to say otherwise.
+            # Flag it loudly and capture the SAME diagnostics the too-short
+            # path already gets - this path had zero evidence before now.
+            if [ "$SLEPT" -gt $(( iv * SUSPEND_OVERSLEEP_MULT )) ] 2>/dev/null; then
+                log "WARN suspend OVERSLEPT: slept ${SLEPT}s of ${iv}s requested ($(( SLEPT / iv ))x) - alarm likely did not fire on schedule; flagging as an anomaly, not a clean success"
+                suspend_hold_diag_snapshot "$wakeup_count_before"
+                push_log "suspend-overslept" 25
+            fi
             suspend_fails=0
             log "WAKE n=$n slept=${SLEPT}s of ${iv}s"
         else
@@ -1542,7 +1863,7 @@ check_update_probation "$@"
 # update actually applied: bump SCRIPT_VERSION by hand on future edits, and the md5
 # is read fresh off disk here so it always reflects whatever is CURRENTLY running,
 # including a script that was just swapped in by apply_script_update.
-SCRIPT_VERSION="${TRMNL_SCRIPT_VERSION:-2026-08-23.1}"
+SCRIPT_VERSION="${TRMNL_SCRIPT_VERSION:-2026-08-24.1}"
 SCRIPT_MD5=""
 if [ -n "$SCRIPT_PATH" ] && [ -r "$SCRIPT_PATH" ] && command -v md5sum >/dev/null 2>&1; then
     SCRIPT_MD5=$(md5sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')
@@ -1616,6 +1937,7 @@ case "$1" in
             # already loses its message that way. Say it while we still can.
             wifi_up >/dev/null 2>&1
             push_log "watchdog-restart" 30
+            echo "watchdog-stale-heartbeat age=${age}s restarts=$wd_restarts at=$(date +%s)" > "$RESTART_REASON_FILE" 2>/dev/null
 
             oldpid=$(cat "$PIDFILE" 2>/dev/null)
             if [ -n "$oldpid" ]; then
@@ -1637,6 +1959,19 @@ case "$1" in
         detect_backup_rtc
         log_power_diagnostics
         log "startup version=${SCRIPT_VERSION:-unknown} script_md5=${SCRIPT_MD5:-unknown}"
+        # Why did the PREVIOUS process end? Known triggers (script update,
+        # server restart command, watchdog-detected stale heartbeat, the wifi
+        # self-heal ladder's rung3) each write RESTART_REASON_FILE just before
+        # ending themselves, since a dead/replaced process cannot explain
+        # itself after the fact - this is what turns the next outage into a
+        # same-day diagnosis instead of a multi-day wait for it to recur.
+        restart_reason=$(cat "$RESTART_REASON_FILE" 2>/dev/null)
+        if [ -n "$restart_reason" ]; then
+            log "startup previous-process-ended reason: $restart_reason"
+            mv "$RESTART_REASON_FILE" "$RESTART_REASON_FILE.last" 2>/dev/null
+        else
+            log "startup previous-process-ended reason: unknown (no marker found - unclean stop, power loss, or first-ever start)"
+        fi
         # A respawn (from apply_script_update or the restart command) can leave an
         # ack still owed to the server - the OLD process may have died before its
         # push_log call went out. Pick it back up here so the ack is not lost.
@@ -1672,6 +2007,12 @@ case "$1" in
             fi
             mv "$PIDFILE" "$PIDFILE.stale" 2>/dev/null
             log "cleared stale loop.pid (pid ${oldpid:-empty} is not our loop)"
+            # Not a full explanation - just what's knowable from here: the
+            # previous loop vanished without any of the normal shutdown paths
+            # (stop, script-update, restart command, watchdog) getting a chance
+            # to record why. Better than a silent "unknown" at the next
+            # startup, which would read as no information at all.
+            echo "manual-start-after-stale-pid oldpid=${oldpid:-unknown} at=$(date +%s)" > "$RESTART_REASON_FILE" 2>/dev/null
         fi
         # Detach the loop from KUAL's session entirely FIRST, and let the detached
         # child do the takeover. Order matters: see the note in __loop above.
@@ -1764,6 +2105,7 @@ case "$1" in
                 kill -- "-$stoppid" 2>/dev/null || kill "$stoppid" 2>/dev/null
             fi
             mv "$PIDFILE" "$PIDFILE.last" 2>/dev/null
+            echo "admin-stop-command pid=${stoppid:-unknown} at=$(date +%s)" > "$RESTART_REASON_FILE" 2>/dev/null
         fi
         # Belt and braces: current loops match __loop; pre-2026-08-03 ones match start.
         pkill -f "calendar.sh __loop" >/dev/null 2>&1
