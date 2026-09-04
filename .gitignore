@@ -3,3 +3,5 @@
 *.log
 .DS_Store
 MAINTAINER_NOTES.md
+__pycache__/
+.pytest_cache/
