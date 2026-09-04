@@ -98,15 +98,15 @@ def test_scanner_actually_detects_a_private_address(tmp_path):
     "passing" for the wrong reason.
     """
     planted = tmp_path / "planted.sh"
-    planted.write_text('SERVER="http://192.168.1.195:8484"\n')
+    planted.write_text('SERVER="http://192.168.50.7:8484"\n')
     hits = _find_rfc1918_hits(planted)
-    assert hits == ["192.168.1.195"]
+    assert hits == ["192.168.50.7"]
 
 
 @pytest.mark.parametrize(
     "address,expected",
     [
-        ("192.168.1.195", True),
+        ("192.168.50.7", True),
         ("10.0.0.1", True),
         ("172.16.0.1", True),
         ("172.31.255.255", True),
