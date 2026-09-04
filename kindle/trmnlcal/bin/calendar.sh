@@ -34,17 +34,26 @@
 #
 # The TRMNL_* environment overrides exist for the host-side test harness; they are
 # never set on the device, so every default below is the real device value -
-# except SERVER, which is a placeholder in this public repo on purpose. The
-# real address is never committed here; it lives only in the private server's
-# served copy of this file.
+# except SERVER, which carries no default at all (address migration step 2).
+# This repo must never commit a real address (see test_no_private_addresses.py),
+# so SERVER is resolved below from TRMNL_SERVER or SERVER_CONFIG_FILE, a file an
+# earlier revision of this script (step 1) wrote on this device from whatever
+# address the private server's served copy actually had. See the "no literal
+# server address" comment further down for what happens if that file is
+# missing.
 #
 # Usage: calendar.sh once | suspendtest [seconds] | start | stop | probe | ruler
 
-SERVER="${TRMNL_SERVER:-http://CHANGE_ME_SERVER_HOST:8484}"
 DEVICE="kindle-01"
 BASE="${TRMNL_BASE:-/mnt/us/calendar}"
-SERVER_CONFIG_FILE="$BASE/server.conf"  # step 1 of the address migration: see
-                                         # the "server config seed" block below
+SERVER_CONFIG_FILE="$BASE/server.conf"  # written by address-migration step 1
+if [ -n "${TRMNL_SERVER+set}" ]; then
+    SERVER="$TRMNL_SERVER"
+elif [ -s "$SERVER_CONFIG_FILE" ]; then
+    SERVER=$(head -n 1 "$SERVER_CONFIG_FILE" | tr -d '\r\n')
+else
+    SERVER=""
+fi
 OUT="$BASE/screen.png"
 TMP="$BASE/screen.png.part"
 LOG="$BASE/calendar.log"
@@ -1961,32 +1970,41 @@ check_update_probation "$@"
 # update actually applied: bump SCRIPT_VERSION by hand on future edits, and the md5
 # is read fresh off disk here so it always reflects whatever is CURRENTLY running,
 # including a script that was just swapped in by apply_script_update.
-SCRIPT_VERSION="${TRMNL_SCRIPT_VERSION:-2026-09-04.2}"
+SCRIPT_VERSION="${TRMNL_SCRIPT_VERSION:-2026-09-04.3}"
 SCRIPT_MD5=""
 if [ -n "$SCRIPT_PATH" ] && [ -r "$SCRIPT_PATH" ] && command -v md5sum >/dev/null 2>&1; then
     SCRIPT_MD5=$(md5sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')
 fi
 
-# Server config seed - step 1 of getting the real server address out of a
-# script that ships in a PUBLIC git history (kindle-wall-display). This repo
-# can never commit the real address (see test_no_private_addresses.py), so
-# the private server that actually serves this file to the device carries the
-# real address as a one-line local patch over SERVER's literal default (see
-# calendar.sh.provenance.json's local_patches, in that private repo, not this
-# one). Every run, before doing anything entrypoint-specific, writes whatever
-# SERVER resolved to into SERVER_CONFIG_FILE the first time that file is
-# absent - never overwriting it once it exists. Once every device has run
-# this at least once, a later script revision can read SERVER_CONFIG_FILE
-# instead of ever carrying the address as a literal at all (see the
-# server-address migration notes for that step, shipped only after
-# confirming - via this device's version/script_md5 check-in - that it is
-# already running this one or later).
-if [ ! -s "$SERVER_CONFIG_FILE" ]; then
-    if printf '%s\n' "$SERVER" > "$SERVER_CONFIG_FILE" 2>/dev/null; then
-        log "wrote server config to $SERVER_CONFIG_FILE ($SERVER)"
-    else
-        log "ERROR could not write $SERVER_CONFIG_FILE; do not ship the read-only migration step until this succeeds on this device"
-    fi
+# No literal server address anywhere in this script (address migration step
+# 2) - SERVER was resolved above from TRMNL_SERVER or SERVER_CONFIG_FILE,
+# which an earlier revision of this same script (step 1) wrote on this
+# device. ONLY ship this revision after confirming, via the private server's
+# check-in log (the version and script_md5 fields on every /api/log call, or
+# equivalently the KINDLE_LOG lines it pushes), that every device this update
+# will reach is already running step 1 or later. A device that skipped step 1
+# - or had /mnt/us/calendar wiped since - has no server.conf, and this
+# refuses to start rather than silently pointing nowhere.
+#
+# stop/probe/ruler never talk to a server, so they still work on an
+# unconfigured device - that is deliberate, since probe is exactly the tool
+# you would reach for to find out why nothing else is working.
+if [ -z "$SERVER" ]; then
+    case "$1" in
+        stop|probe|ruler)
+            log "WARN no server configured ($SERVER_CONFIG_FILE missing or empty); $1 does not need it"
+            ;;
+        *)
+            log "ERROR no server configured: $SERVER_CONFIG_FILE is missing or empty and TRMNL_SERVER is not set. Refusing to start."
+            text_card "TRMNL: NOT CONFIGURED" \
+                "$SERVER_CONFIG_FILE is missing." \
+                "This device never ran the config-seed" \
+                "script, or calendar/ was wiped."
+            exit 1
+            ;;
+    esac
+else
+    log "startup server=$SERVER"
 fi
 
 case "$1" in
