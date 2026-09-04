@@ -43,6 +43,8 @@
 SERVER="${TRMNL_SERVER:-http://CHANGE_ME_SERVER_HOST:8484}"
 DEVICE="kindle-01"
 BASE="${TRMNL_BASE:-/mnt/us/calendar}"
+SERVER_CONFIG_FILE="$BASE/server.conf"  # step 1 of the address migration: see
+                                         # the "server config seed" block below
 OUT="$BASE/screen.png"
 TMP="$BASE/screen.png.part"
 LOG="$BASE/calendar.log"
@@ -1959,10 +1961,32 @@ check_update_probation "$@"
 # update actually applied: bump SCRIPT_VERSION by hand on future edits, and the md5
 # is read fresh off disk here so it always reflects whatever is CURRENTLY running,
 # including a script that was just swapped in by apply_script_update.
-SCRIPT_VERSION="${TRMNL_SCRIPT_VERSION:-2026-09-04.1}"
+SCRIPT_VERSION="${TRMNL_SCRIPT_VERSION:-2026-09-04.2}"
 SCRIPT_MD5=""
 if [ -n "$SCRIPT_PATH" ] && [ -r "$SCRIPT_PATH" ] && command -v md5sum >/dev/null 2>&1; then
     SCRIPT_MD5=$(md5sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')
+fi
+
+# Server config seed - step 1 of getting the real server address out of a
+# script that ships in a PUBLIC git history (kindle-wall-display). This repo
+# can never commit the real address (see test_no_private_addresses.py), so
+# the private server that actually serves this file to the device carries the
+# real address as a one-line local patch over SERVER's literal default (see
+# calendar.sh.provenance.json's local_patches, in that private repo, not this
+# one). Every run, before doing anything entrypoint-specific, writes whatever
+# SERVER resolved to into SERVER_CONFIG_FILE the first time that file is
+# absent - never overwriting it once it exists. Once every device has run
+# this at least once, a later script revision can read SERVER_CONFIG_FILE
+# instead of ever carrying the address as a literal at all (see the
+# server-address migration notes for that step, shipped only after
+# confirming - via this device's version/script_md5 check-in - that it is
+# already running this one or later).
+if [ ! -s "$SERVER_CONFIG_FILE" ]; then
+    if printf '%s\n' "$SERVER" > "$SERVER_CONFIG_FILE" 2>/dev/null; then
+        log "wrote server config to $SERVER_CONFIG_FILE ($SERVER)"
+    else
+        log "ERROR could not write $SERVER_CONFIG_FILE; do not ship the read-only migration step until this succeeds on this device"
+    fi
 fi
 
 case "$1" in
