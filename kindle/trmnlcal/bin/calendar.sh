@@ -276,6 +276,15 @@ ACK_ID=""
 # like that. Sets push_rc; on failure also logs the exit status and payload size
 # in bytes, so the NEXT silent-looking failure explains itself from calendar.log
 # alone. $2 is only used in that failure log line, to name which part failed.
+#
+# The wifi-probe-begin push (see main_loop) fires deliberately before wifi_up()
+# has associated, specifically so a hung probe leaves server-side evidence - so
+# it is EXPECTED to fail with "could not connect" every time the radio is not
+# up yet. That is not a real error: upload_backlog_if_any() ships it once the
+# next successful cycle closes the gap. Logging it at ERROR buried the signal
+# in 70 identical lines/day and made a genuine failure hard to spot. Any other
+# push_log failure, including a wifi-probe-begin one that fails for a DIFFERENT
+# reason (DNS, TLS, a server 5xx, wrong URL), still logs ERROR - that is real.
 _push_log_post() {   # $1 = JSON payload string, $2 = label for the failure log line
     payload_file="$BASE/push_log.payload.$$"
     printf '%s' "$1" > "$payload_file"
@@ -289,7 +298,24 @@ _push_log_post() {   # $1 = JSON payload string, $2 = label for the failure log 
                    --post-file="$payload_file" "$SERVER/api/log" >/dev/null 2>&1
               push_rc=$? ;;
     esac
-    [ "$push_rc" -ne 0 ] && log "ERROR push_log[$2] POST failed rc=$push_rc bytes=${payload_bytes:-unknown}"
+    if [ "$push_rc" -ne 0 ]; then
+        # curl rc=7 and wget rc=4 both mean "could not connect" - the expected
+        # shape of a wifi-probe-begin failure, not an unexpected one.
+        noconn_rc=7
+        [ "$HTTP" = "wget" ] && noconn_rc=4
+        case "$2" in
+            wifi-probe-begin*)
+                if [ "$push_rc" -eq "$noconn_rc" ]; then
+                    log "push_log[$2] POST could not connect (rc=$push_rc, wifi not up yet as expected); queued for backlog delivery"
+                else
+                    log "ERROR push_log[$2] POST failed rc=$push_rc bytes=${payload_bytes:-unknown}"
+                fi
+                ;;
+            *)
+                log "ERROR push_log[$2] POST failed rc=$push_rc bytes=${payload_bytes:-unknown}"
+                ;;
+        esac
+    fi
     # Per-call scratch file, not device state - no trash-put on this firmware, and
     # nothing here is worth a rename-don't-delete audit trail like stop.flag/pidfile.
     rm -f "$payload_file" 2>/dev/null
@@ -1933,7 +1959,7 @@ check_update_probation "$@"
 # update actually applied: bump SCRIPT_VERSION by hand on future edits, and the md5
 # is read fresh off disk here so it always reflects whatever is CURRENTLY running,
 # including a script that was just swapped in by apply_script_update.
-SCRIPT_VERSION="${TRMNL_SCRIPT_VERSION:-2026-09-03.1}"
+SCRIPT_VERSION="${TRMNL_SCRIPT_VERSION:-2026-09-04.1}"
 SCRIPT_MD5=""
 if [ -n "$SCRIPT_PATH" ] && [ -r "$SCRIPT_PATH" ] && command -v md5sum >/dev/null 2>&1; then
     SCRIPT_MD5=$(md5sum "$SCRIPT_PATH" 2>/dev/null | awk '{print $1}')
